@@ -1,0 +1,502 @@
+package com.open.messaging.bigbro.client;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.google.protobuf.InvalidProtocolBufferException;
+import com.open.messaging.bigbro.broker.BigQueueTextMessage;
+import com.open.messaging.bigbro.common.dto.BrokerMessage;
+import com.open.messaging.bigbro.common.dto.Message;
+import com.open.messaging.bigbro.common.dto.SubscriptionRequest;
+import com.open.messaging.bigbro.common.util.IPAddressUtil;
+import com.open.messaging.bigbro.exceptions.BrokerNonRetryableException;
+import com.open.messaging.bigbro.exceptions.BrokerRetryableException;
+import io.grpc.netty.shaded.io.netty.util.internal.StringUtil;
+import io.vertx.core.AbstractVerticle;
+import io.vertx.core.Promise;
+import io.vertx.core.Vertx;
+import io.vertx.core.VertxOptions;
+import io.vertx.core.http.HttpMethod;
+import io.vertx.core.http.HttpServer;
+import io.vertx.core.http.HttpServerRequest;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationContext;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.util.CollectionUtils;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
+
+/**
+ * The BrokerClient class provides methods to interact with a message broker, including publishing
+ * messages to a queue and subscribing to a queue.
+ */
+@Slf4j
+public class BrokerClient {
+
+  private final WebClient webClient;
+  private final Vertx vertx;
+  private String prefix = StringUtil.EMPTY_STRING;
+  private QueueClient queueClient = null;
+  private final AtomicReference<Map<String, JsonNode>> cachedAllocations = new AtomicReference<>();
+  private final String brokerUrl;
+  private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+  private List<ScheduledFuture<?>> futures = new ArrayList<ScheduledFuture<?>>();
+  private ConcurrentHashMap<String, SubscriptionRequest> subscriptions = new ConcurrentHashMap<>();
+  protected ConcurrentHashMap<String, Subscription> subscriptionStatus = new ConcurrentHashMap<>();
+
+  private int connectTimeout = 3000;
+  private int readTimeout = 5000;
+
+  /**
+   * Constructs a BrokerClient with the specified base URL and application context.
+   *
+   * @param baseUrl the base URL of the broker service
+   * @param applicationContext the Spring application context to retrieve environment properties
+   */
+  public List<ScheduledFuture<?>> getScheduleFuture() {
+    return futures;
+  }
+
+  void setUpSchedule() {
+    this.futures.add(
+        scheduler.scheduleAtFixedRate(
+            () -> {
+              try {
+                if (subscriptions != null && queueClient != null) {
+                  for (String subscriptionId : subscriptions.keySet()) {
+                    try {
+                      log.debug("Re assuring subscription of consumer [{}]", subscriptionId);
+                      if (isActive(subscriptionId)) {
+                        queueClient
+                            .doRenew(subscriptions.get(subscriptionId), subscriptionId)
+                            .block();
+                      } else {
+                        expireIfPresent(subscriptionId);
+                      }
+
+                    } catch (Exception e) {
+                      log.error(
+                          "Failed to renew susbcription  [{}]: reason {}",
+                          subscriptionId,
+                          e.getMessage());
+                      log.error(e.getMessage(), e);
+                    }
+                  }
+                } else {
+                  log.warn(
+                      "Requests list or queueClient is null, skipping scheduled subscription.");
+                }
+              } catch (Exception e) {
+                log.error("Unexpected error in scheduled subscription task: {}", e.getMessage(), e);
+              }
+            },
+            0,
+            2000,
+            TimeUnit.MILLISECONDS));
+  }
+
+  public BrokerClient(
+      String brokerUrl,
+      ApplicationContext applicationContext,
+      int connectTimeout,
+      int readTimeout) {
+
+    this.brokerUrl = brokerUrl;
+    this.webClient = ClientFactory.createClient(connectTimeout, readTimeout);
+    this.vertx = Vertx.vertx(); // Create Vert.x instance
+    this.prefix =
+        applicationContext
+            .getEnvironment()
+            .getProperty("bigbro.ip.prefix", StringUtil.EMPTY_STRING);
+
+    queueClient = new QueueClient(brokerUrl, webClient);
+
+    setUpSchedule();
+  }
+
+  public BrokerClient(String brokerUrl, ApplicationContext applicationContext) {
+
+    this.brokerUrl = brokerUrl;
+    this.webClient = ClientFactory.createClient(connectTimeout, readTimeout);
+    this.vertx = Vertx.vertx(); // Create Vert.x instance
+    this.prefix =
+        applicationContext
+            .getEnvironment()
+            .getProperty("bigbro.ip.prefix", StringUtil.EMPTY_STRING);
+
+    queueClient =
+        new QueueClient(brokerUrl, ClientFactory.createClient(connectTimeout, readTimeout));
+
+    setUpSchedule();
+  }
+
+  /**
+   * Constructs a BrokerClient with the specified base URL and IP prefix.
+   *
+   * @param baseUrl the base URL of the broker service
+   * @param prefix the IP prefix to be used for callback URLs
+   */
+  public BrokerClient(String brokerUrl, String prefix) {
+    this.brokerUrl = brokerUrl;
+
+    this.webClient = ClientFactory.createClient(connectTimeout, readTimeout);
+
+    this.vertx = Vertx.vertx(); // Create Vert.x instance
+    this.prefix = prefix;
+    queueClient =
+        new QueueClient(brokerUrl, ClientFactory.createClient(connectTimeout, readTimeout));
+    setUpSchedule();
+  }
+
+  public void delete(String sourceQueue) {
+    queueClient.delete(sourceQueue).block();
+  }
+
+  /**
+   * Publishes a message to the specified queue.
+   *
+   * @param queue the name of the queue to publish the message to
+   * @param message the message to be published
+   * @return a Mono emitting the response from the broker as a String
+   */
+  public Mono<String> publish(String queue, Message _message) {
+
+    BrokerMessage brokerMessage = BrokerMessage.fromMessage(_message);
+    BigQueueTextMessage message = BrokerMessage.toBigQueueTextMessage(brokerMessage);
+
+    Map<String, JsonNode> allocations = cachedAllocations.get();
+    String brokerUrl = this.brokerUrl;
+
+    if (!CollectionUtils.isEmpty(allocations)) {
+      JsonNode jsonNode = allocations.get(queue);
+      if (jsonNode != null) {
+        String host = jsonNode.get("meta").get("node").get("host").asText();
+        int port = jsonNode.get("meta").get("node").get("port").asInt();
+        brokerUrl = "http://" + host + ":" + port;
+      }
+    }
+
+    String url = brokerUrl + "/api/queue/publish/" + queue;
+
+    return webClient
+        .post()
+        .uri(url)
+        .bodyValue(message.toByteArray())
+        .retrieve()
+        // --- Handle 4xx/503/504/502 as retryable ---
+        .onStatus(
+            status ->
+                status.is4xxClientError()
+                    || status == HttpStatus.SERVICE_UNAVAILABLE
+                    || status == HttpStatus.BAD_GATEWAY
+                    || status == HttpStatus.GATEWAY_TIMEOUT,
+            clientResponse ->
+                clientResponse
+                    .bodyToMono(String.class)
+                    .flatMap(
+                        errorBody ->
+                            Mono.error(
+                                new BrokerRetryableException(
+                                    "Retryable error: "
+                                        + clientResponse.statusCode()
+                                        + " - "
+                                        + errorBody))))
+        // --- Handle 5xx as non-retryable ---
+        .onStatus(
+            HttpStatusCode::is5xxServerError,
+            clientResponse ->
+                clientResponse
+                    .bodyToMono(String.class)
+                    .flatMap(
+                        errorBody ->
+                            Mono.error(
+                                new BrokerNonRetryableException(
+                                    "Non-retryable error: "
+                                        + clientResponse.statusCode()
+                                        + " - "
+                                        + errorBody))))
+        .bodyToMono(String.class)
+        .doOnError(
+            ex ->
+                log.error(
+                    "Error before mapping - Type: {}, Message: {}",
+                    ex.getClass().getName(),
+                    ex.getMessage(),
+                    ex))
+        // --- Map low-level transport and I/O errors ---
+        .onErrorMap(
+            throwable -> {
+              if (throwable instanceof BrokerRetryableException
+                  || throwable instanceof BrokerNonRetryableException) {
+                return throwable;
+              }
+
+              Throwable cause = throwable.getCause() != null ? throwable.getCause() : throwable;
+
+              if (cause instanceof BrokerRetryableException
+                  || cause instanceof BrokerNonRetryableException) {
+                return cause;
+              }
+
+              // Connection failures (e.g. refused, timed out)
+              if (cause instanceof java.net.ConnectException) {
+                return new BrokerRetryableException(
+                    "Connection failed: " + cause.getMessage(), cause);
+              }
+
+              // Handle Reactor Netty native exceptions
+              if (cause instanceof io.netty.channel.unix.Errors.NativeIoException
+                  || cause instanceof java.net.SocketException
+                  || cause instanceof java.io.IOException) {
+
+                String msg = cause.getMessage() != null ? cause.getMessage() : "";
+
+                // Transient network conditions
+                if (msg.contains("Connection reset")
+                    || msg.contains("Broken pipe")
+                    || msg.contains("Connection refused")
+                    || msg.contains("recvAddress")) {
+                  return new BrokerRetryableException("Transient network error: " + msg, cause);
+                }
+              }
+
+              return new BrokerNonRetryableException(
+                  "Unexpected error: " + throwable.getMessage(), throwable);
+            })
+        // --- Retry policy for retryable exceptions ---
+        .retryWhen(
+            Retry.backoff(3, Duration.ofSeconds(2))
+                .filter(ex -> ex instanceof BrokerRetryableException)
+                .onRetryExhaustedThrow(
+                    (spec, signal) ->
+                        new BrokerNonRetryableException(
+                            "Retries exhausted: " + signal.failure().getMessage(),
+                            signal.failure())))
+        // Optional: log on retry
+        .doOnError(
+            ex -> {
+              if (ex instanceof BrokerRetryableException) {
+                log.error("[WARN] Retrying publish due to transient error: " + ex.getMessage());
+              } else {
+                log.error("[ERROR] Publish failed permanently: " + ex.getMessage());
+              }
+            });
+  }
+
+  /**
+   * Subscribes to a specified queue and processes messages using the provided consumer.
+   *
+   * @param queue the name of the queue to subscribe to
+   * @param consumer a consumer to process received messages
+   * @return a Mono emitting the response from the broker as a String
+   */
+  public Mono<String> subscribe(String queue, Consumer<Message> consumer) {
+    return startReciever(consumer)
+        .flatMap(
+            subscription -> {
+              SubscriptionRequest message = new SubscriptionRequest();
+              message.setCallback(subscription.getCallbackUrl());
+              message.setQueue(queue);
+              message.setId(UUID.randomUUID().toString());
+              return queueClient
+                  .doSubscribe(message)
+                  .map(
+                      subscriptionResponse -> {
+                        subscriptions.put(subscriptionResponse.getId(), message);
+                        subscriptionStatus.put(subscriptionResponse.getId(), subscription);
+                        return subscriptionResponse.getId();
+                      });
+            });
+  }
+
+  // Stop a specific subscription
+  public void stopSubscription(String id) {
+    subscriptionStatus.computeIfPresent(
+        id,
+        (k, v) -> {
+          v.setStatus(false);
+          return v;
+        });
+  }
+
+  // Stop all subscriptions
+  public void stopSubscription() {
+    for (String id : subscriptionStatus.keySet()) {
+      subscriptionStatus.computeIfPresent(
+          id,
+          (k, v) -> {
+            v.setStatus(false);
+            return v;
+          });
+    }
+  }
+
+  // Resume all subscriptions
+  public void resumeSubscription() {
+    for (String id : subscriptionStatus.keySet()) {
+      subscriptionStatus.computeIfPresent(
+          id,
+          (k, v) -> {
+            v.setStatus(true);
+            return v;
+          });
+    }
+  }
+
+  // Resume a specific subscription
+  public void resumeSubscription(String id) {
+    subscriptionStatus.computeIfPresent(
+        id,
+        (k, v) -> {
+          v.setStatus(true);
+          return v;
+        });
+  }
+
+  // Optional: check if subscription is active
+  public boolean isActive(String id) {
+    Subscription subscription = subscriptionStatus.getOrDefault(id, null);
+    if (subscription != null) {
+      return subscription.isStatus();
+    }
+    return false;
+  }
+
+  private void expireIfPresent(String id) {
+    Subscription subscription = subscriptionStatus.get(id);
+
+    if (subscription != null) {
+      long idleTime = System.currentTimeMillis() - subscription.getLastPingedAt();
+      if (idleTime > 10_000) {
+        subscription
+            .getServer()
+            .close()
+            .onSuccess(
+                v -> {
+                  subscriptionStatus.remove(id);
+                  log.info("Subscription [{}] expired and server closed.", id);
+                })
+            .onFailure(
+                err -> {
+                  log.warn(
+                      "Unable to close server for subscription [{}]. Cause: {}",
+                      id,
+                      err.getMessage(),
+                      err);
+                });
+      }
+    }
+  }
+
+  private Mono<Subscription> startReciever(Consumer<Message> consumer) {
+    CompletableFuture<Subscription> future = new CompletableFuture<>();
+
+    vertx.deployVerticle(
+        new AbstractVerticle() {
+          @Override
+          public void start(Promise<Void> startPromise) {
+
+            VertxOptions options =
+                new VertxOptions()
+                    .setWorkerPoolSize(2500)
+                    .setMaxWorkerExecuteTime(7) // 6 sec safe margin
+                    .setMaxWorkerExecuteTimeUnit(TimeUnit.SECONDS);
+
+            Vertx vertxWithWorkers = Vertx.vertx(options);
+            HttpServer server = vertxWithWorkers.createHttpServer();
+            server.requestHandler(
+                req -> {
+                  // Move heavy 5-sec work to worker threads
+                  vertxWithWorkers.executeBlocking(
+                      promise -> {
+                        try {
+                          handleRequest(req, consumer); // <- 5-sec logic here
+                          promise.complete();
+                        } catch (Exception e) {
+                          promise.fail(e);
+                        }
+                      });
+                });
+
+            server.listen(
+                0,
+                http -> { // Port 0 -> Random available port
+                  if (http.succeeded()) {
+                    int assignedPort = http.result().actualPort();
+                    String callbackUrl =
+                        "http://"
+                            + IPAddressUtil.getIPv4Address(prefix)
+                            + ":"
+                            + assignedPort
+                            + "/callback";
+                    System.out.println("Vert.x server started at " + callbackUrl);
+                    future.complete(
+                        new Subscription(System.currentTimeMillis(), server, true, callbackUrl));
+                    startPromise.complete();
+                  } else {
+                    future.completeExceptionally(http.cause());
+                    startPromise.fail(http.cause());
+                  }
+                });
+          }
+        });
+
+    return Mono.fromFuture(future);
+  }
+
+  private void handleRequest(HttpServerRequest req, Consumer<Message> consumer) {
+    if ("/callback".equals(req.path())
+        && "application/x-protobuf".equals(req.getHeader("Content-Type"))
+        && req.method() == HttpMethod.POST) {
+      req.bodyHandler(
+          buffer -> {
+            byte[] messageBytes = buffer.getBytes();
+            try {
+              consumer.accept(
+                  BrokerMessage.fromBigMessage(BigQueueTextMessage.parseFrom(messageBytes)));
+              req.response()
+                  .setStatusCode(201)
+                  .putHeader("Content-Type", "text/plain")
+                  .end("Protobuf message received");
+            } catch (InvalidProtocolBufferException e) {
+              req.response()
+                  .setStatusCode(500)
+                  .putHeader("Content-Type", "text/plain")
+                  .end(e.getMessage());
+            }
+          });
+    } else if ("/callback".equals(req.path()) && req.method() == HttpMethod.HEAD) {
+
+      String subscriptionId = req.getHeader("x-consumer-id");
+      int statusCode = 201;
+
+      if (subscriptionId != null && !subscriptionId.trim().isEmpty()) {
+        boolean status = isActive(subscriptionId);
+        if (!status) {
+          statusCode = 503;
+        }
+      }
+
+      req.response()
+          .setStatusCode(statusCode)
+          .putHeader("Content-Type", "text/plain")
+          .end("Protobuf message received");
+
+    } else {
+      req.response().setStatusCode(400).end("Invalid request");
+    }
+  }
+}
